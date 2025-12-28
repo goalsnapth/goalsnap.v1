@@ -170,7 +170,7 @@ export default function Dashboard() {
       // 1. เอาเฉพาะคู่ที่ยังไม่เริ่ม หรือ กำลังแข่งครึ่งแรก
       if (!['NS', 'TBD', 'PST', '1H', 'LIVE'].includes(status)) return false;
       const htProb = match.analysis?.first_half_analysis?.probability || 0;
-       return htProb > 60; 
+      return match.analysis?.first_half_analysis?.has_value || false; 
     }
 
     return true;
