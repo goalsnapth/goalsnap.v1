@@ -43,8 +43,8 @@ interface BackendPrediction {
 }
 
 interface AnalysisResponse {
-  match: Match;
-  prediction: BackendPrediction;
+  match_info: Match;
+  ai_analysis: BackendPrediction;
 }
 
 interface MatchWithAnalysis extends Match {
@@ -103,7 +103,7 @@ export default function Dashboard() {
         // Fetch Analysis Parallel
         const analysisPromises = basicMatches.map((m) => 
           api.get<AnalysisResponse>(`/api/v1/matches/${m.id}/analyze`)
-             .then(res => ({ id: m.id, data: res.data.prediction }))
+             .then(res => ({ id: m.id, data: res.data.ai_analysis }))
              .catch(() => null)
         );
 
