@@ -23,7 +23,10 @@ interface Match {
 }
 
 interface BackendPrediction {
-  advice: string;
+  ai_insight: {
+    main_pick: string;
+    confidence: string;
+  };
   probabilities: {
     home_win: number;
     draw: number;
@@ -358,7 +361,7 @@ export default function Dashboard() {
                     time={match.kickoff_time} 
                     isPremium={isUnlocked}
                     prediction={match.analysis ? {
-                        advice: match.analysis.advice,
+                      advice: match.analysis.ai_insight.main_pick,
                         probability: match.analysis.probabilities.home_win > match.analysis.probabilities.away_win 
                      ? match.analysis.probabilities.home_win 
                      : match.analysis.probabilities.away_win,
