@@ -5,12 +5,14 @@ import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pathlib
+import httpx
+from typing import List, Optional
 
 load_dotenv()
 
 class FootballDataService:
     def __init__(self):
-        self.api_key = os.getenv("RAPIDAPI_KEY")
+        self.api_key = os.getenv("RAPIDAPI_KEY") or os.getenv("FOOTBALL_API_KEY")
         self.base_url = "https://v3.football.api-sports.io"
         
         # สร้างโฟลเดอร์สำหรับเก็บ Cache ถ้ายังไม่มี
@@ -19,7 +21,8 @@ class FootballDataService:
 
         # ระยะเวลา Cache (วินาที)
         self.STATS_CACHE_DURATION = 86400  # 24 ชั่วโมง (สำหรับค่าพลังทีม)
-        self.MATCHES_CACHE_DURATION = 1800 # 30 นาที (สำหรับตารางแข่ง)
+        self.MATCHES_CACHE_DURATION = 900  # 15 นาที (ลดลงเพื่อให้ Base data สดใหม่ขึ้น)
+        self.LIVE_CACHE_DURATION = 15      # 🔥 15 วินาที (สำหรับข้อมูล Live Score)
 
         # โหลด team_stats จาก Cache ทั้งหมดเข้า Memory เพื่อความเร็ว
         self.team_stats = {}
@@ -58,22 +61,21 @@ class FootballDataService:
 
     def _load_all_stats_from_disk(self):
         """ โหลด Stats ของทุกลีกที่เคยบันทึกไว้เข้าตัวแปร self.team_stats """
-        # วิธีนี้ช่วยให้ Server Restart แล้วข้อมูลไม่หาย ไม่ต้องโหลดใหม่
+        if not os.path.exists(self.cache_dir): return
+        
         for filename in os.listdir(self.cache_dir):
             if filename.startswith("stats_league_"):
-                data = self._load_json_cache(filename, self.STATS_CACHE_DURATION) # ใช้กฎ 24 ชม.
+                # ใช้กฎ 24 ชม. แต่โหลดเข้ามาก่อนค่อยว่ากัน
+                data = self._load_json_cache(filename, self.STATS_CACHE_DURATION * 2) 
                 if data:
                     self.team_stats.update(data)
-                    # เก็บ ID ลีกไว้ว่าโหลดแล้ว จะได้ไม่โหลดซ้ำ
-                    league_id = int(filename.split('_')[2].split('.')[0])
-                    # (เราอาจจะไม่ต้องใช้ set leagues_stats_loaded แบบเดิมแล้ว เพราะเช็คจากไฟล์เอา)
 
     # --- 📊 Logic การดึงข้อมูล ---
 
     def _fetch_team_stats_from_api(self, league_id, season):
         """ 
         ดึงตารางคะแนน (Standings) -> เก็บลงไฟล์ Cache แยกรายลีก 
-        อายุ Cache: 24 ชั่วโมง (ประหยัด API มาก)
+        อายุ Cache: 24 ชั่วโมง
         """
         if not self.api_key: return
 
@@ -82,7 +84,6 @@ class FootballDataService:
         cached_data = self._load_json_cache(cache_filename, self.STATS_CACHE_DURATION)
         
         if cached_data:
-            # ถ้ามี Cache และยังไม่หมดอายุ ให้อัปเดต Memory แล้วจบเลย
             self.team_stats.update(cached_data)
             return
 
@@ -133,105 +134,140 @@ class FootballDataService:
         except Exception as e:
             print(f"❌ Stats Error (League {league_id}): {e}")
 
-    def get_upcoming_matches(self):
+    def _get_live_matches_data(self):
         """
-        🔥 ดึงแมตช์ (Cache 30 นาที) 
-        และ ดึง Stats (Cache 24 ชม.) เฉพาะลีกที่จำเป็น
+        🔥 ดึงข้อมูลเฉพาะคู่ที่กำลังแข่ง (Live) 
+        Cache สั้นมาก (15 วินาที) เพื่อความ Real-time
         """
-        # 1. เช็ค Cache รายการแข่ง
-        cache_filename = "matches_upcoming.json"
-        cached_matches = self._load_json_cache(cache_filename, self.MATCHES_CACHE_DURATION)
+        cache_filename = "matches_live.json"
+        cached_data = self._load_json_cache(cache_filename, self.LIVE_CACHE_DURATION)
         
-        if cached_matches:
-            print("⚡ Using File Cache for Matches")
-            return cached_matches
+        if cached_data is not None:
+            return cached_data
 
         if not self.api_key: return []
 
-        all_matches = []
-        dates_to_fetch = [
-            datetime.now().strftime("%Y-%m-%d"),
-            (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        ]
-        current_year = datetime.now().year
-        season = current_year if datetime.now().month >= 7 else current_year - 1
+        try:
+            # ยิง Endpoint พิเศษสำหรับ Live โดยเฉพาะ (กิน Resource น้อยกว่า)
+            url = f"{self.base_url}/fixtures"
+            params = {"live": "all"}
+            headers = {"x-rapidapi-key": self.api_key, "x-rapidapi-host": "v3.football.api-sports.io"}
+            
+            res = requests.get(url, headers=headers, params=params, timeout=10)
+            data = res.json().get("response", [])
+            
+            # บันทึก Cache Live
+            self._save_json_cache(cache_filename, data)
+            return data
+        except Exception as e:
+            print(f"⚠️ Error fetching live matches: {e}")
+            return []
 
-        print(f"📡 Fetching Matches from API: {dates_to_fetch}")
-
-        headers = {"x-rapidapi-key": self.api_key, "x-rapidapi-host": "v3.football.api-sports.io"}
-        url = f"{self.base_url}/fixtures"
-
-        for date_str in dates_to_fetch:
-            params = {"date": date_str} # เอาทุกสถานะ
-
-            try:
-                res = requests.get(url, headers=headers, params=params)
-                data = res.json()
-                
-                if "response" in data:
-                    print(f"   found {len(data['response'])} matches on {date_str}")
-                    
-                    # รวบรวม League ID ที่ต้องใช้ เพื่อดึง Stats
-                    # เราจะดึง Stats ให้ครบก่อน แล้วค่อย Loop สร้าง Match Object
-                    leagues_needed = set()
-                    for item in data["response"]:
-                        leagues_needed.add(item["league"]["id"])
-                    
-                    # ดึง Stats เฉพาะลีกที่ยังไม่มีใน Memory
-                    for lid in leagues_needed:
-                        # เช็คว่ามีข้อมูลทีมในลีกนี้อยู่ใน Memory หรือยัง (เช็คแบบคร่าวๆ)
-                        # แต่เพื่อความชัวร์ เรียก _fetch_team_stats_from_api เลย 
-                        # เพราะข้างในฟังก์ชันมีระบบเช็ค Cache ไฟล์ให้อยู่แล้ว (เร็ว)
-                        self._fetch_team_stats_from_api(lid, season)
-
-                    # สร้าง Match List
-                    for item in data["response"]:
-                        home = item["teams"]["home"]["name"]
-                        away = item["teams"]["away"]["name"]
-                        
-                        # กรอง: ถ้าไม่มี Stats ก็ข้าม (แสดงว่า API Standings มีปัญหา หรือ เป็นบอลถ้วยที่ไม่มีตารางคะแนน)
-                        if home not in self.team_stats or away not in self.team_stats: continue
-                        
-                        all_matches.append({
-                            "id": item["fixture"]["id"],
-                            "home_team": home,
-                            "away_team": away,
-                            "home_id": item["teams"]["home"]["id"],
-                            "away_id": item["teams"]["away"]["id"],
-                            "home_logo": item["teams"]["home"]["logo"],
-                            "away_logo": item["teams"]["away"]["logo"],
-                            "league": item["league"]["name"],
-                            "league_logo": item["league"]["logo"],
-                            "kickoff_time": item["fixture"]["date"],
-                            "status": item["fixture"]["status"]["short"],
-                            "home_stats": self.team_stats.get(home, {"attack":1.0, "defense":1.0, "form": "-----"}),
-                            "away_stats": self.team_stats.get(away, {"attack":1.0, "defense":1.0, "form": "-----"})
-                        })
-            except Exception as e:
-                print(f"❌ Error fetching date {date_str}: {e}")
-                continue
-
-        all_matches.sort(key=lambda x: x["kickoff_time"])
-
-        # บันทึก Cache รายการแข่ง
-        self._save_json_cache(cache_filename, all_matches)
+    def get_upcoming_matches(self):
+        """
+        🔥 ดึงแมตช์ (Cache 15 นาที) 
+        🔥 Merge ข้อมูล Live Score (Cache 15 วินาที)
+        """
+        # 1. พยายามโหลด Base Matches จาก Cache ก่อน
+        cache_filename = "matches_upcoming.json"
+        all_matches = self._load_json_cache(cache_filename, self.MATCHES_CACHE_DURATION)
         
-        print(f"✅ Total matches loaded & Cached: {len(all_matches)}")
+        # ถ้าไม่มี Cache ค่อยยิง API Base Data
+        if all_matches is None:
+            if not self.api_key: return []
+            
+            all_matches = []
+            dates_to_fetch = [
+                datetime.now().strftime("%Y-%m-%d"),
+                (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            ]
+            current_year = datetime.now().year
+            season = current_year if datetime.now().month >= 7 else current_year - 1
+
+            print(f"📡 Fetching Matches from API: {dates_to_fetch}")
+            headers = {"x-rapidapi-key": self.api_key, "x-rapidapi-host": "v3.football.api-sports.io"}
+            url = f"{self.base_url}/fixtures"
+
+            for date_str in dates_to_fetch:
+                params = {"date": date_str} 
+
+                try:
+                    res = requests.get(url, headers=headers, params=params)
+                    data = res.json()
+                    
+                    if "response" in data:
+                        print(f"   found {len(data['response'])} matches on {date_str}")
+                        
+                        # Fetch Stats Logic
+                        leagues_needed = set()
+                        for item in data["response"]:
+                            leagues_needed.add(item["league"]["id"])
+                        
+                        for lid in leagues_needed:
+                            self._fetch_team_stats_from_api(lid, season)
+
+                        # Create Match Objects
+                        for item in data["response"]:
+                            home = item["teams"]["home"]["name"]
+                            away = item["teams"]["away"]["name"]
+                            
+                            # Skip if no stats (optional)
+                            if home not in self.team_stats or away not in self.team_stats: continue
+                            
+                            all_matches.append({
+                                "id": item["fixture"]["id"],
+                                "home_team": home,
+                                "away_team": away,
+                                "home_id": item["teams"]["home"]["id"],
+                                "away_id": item["teams"]["away"]["id"],
+                                "home_logo": item["teams"]["home"]["logo"],
+                                "away_logo": item["teams"]["away"]["logo"],
+                                "league": item["league"]["name"],
+                                "league_logo": item["league"]["logo"],
+                                "kickoff_time": item["fixture"]["date"],
+                                "status": item["fixture"]["status"]["short"],
+                                "goals_home": item["goals"]["home"], # เพิ่มฟิลด์สกอร์
+                                "goals_away": item["goals"]["away"], # เพิ่มฟิลด์สกอร์
+                                "home_stats": self.team_stats.get(home, {"attack":1.0, "defense":1.0, "form": "-----"}),
+                                "away_stats": self.team_stats.get(away, {"attack":1.0, "defense":1.0, "form": "-----"})
+                            })
+                except Exception as e:
+                    print(f"❌ Error fetching date {date_str}: {e}")
+                    continue
+
+            all_matches.sort(key=lambda x: x["kickoff_time"])
+            self._save_json_cache(cache_filename, all_matches)
+            print(f"✅ Total matches loaded & Cached: {len(all_matches)}")
+
+        # 2. 🔥 Hybrid Merge: ดึงข้อมูล Live ล่าสุดมาทับข้อมูล Base
+        live_data = self._get_live_matches_data()
+        if live_data:
+            # สร้าง Map เพื่อความเร็วในการค้นหา
+            live_map = {m['fixture']['id']: m for m in live_data}
+            
+            for match in all_matches:
+                m_id = match['id']
+                if m_id in live_map:
+                    live_match = live_map[m_id]
+                    # อัปเดตข้อมูลสด
+                    match['status'] = live_match['fixture']['status']['short']     # เช่น 1H, 2H, 35'
+                    match['elapsed'] = live_match['fixture']['status']['elapsed']  # นาทีที่แข่ง
+                    match['goals_home'] = live_match['goals']['home']              # สกอร์เจ้าบ้าน
+                    match['goals_away'] = live_match['goals']['away']              # สกอร์ทีมเยือน
+        
         return all_matches
 
-    # ... (ส่วน get_match_by_id, get_head_to_head, get_match_odds, etc. เหมือนเดิม) ...
-    # หมายเหตุ: get_match_odds คือ Real-time เสมอ ไม่ต้อง Cache (หรือ Cache สั้นๆ 5 นาทีก็ได้ถ้าอยากประหยัดสุดๆ)
-
     def get_match_by_id(self, match_id: int):
+        # ลองหาในลิสต์ Upcoming (ที่มี Live Data ผสมแล้ว) ก่อน
         matches = self.get_upcoming_matches()
         for m in matches:
             if m['id'] == match_id: return m
+            
         if self.api_key:
             return self._fetch_single_match_direct(match_id)
         return {}
     
     def _fetch_single_match_direct(self, match_id):
-        # ... (เหมือนเดิม แต่เพิ่มการเรียก self._fetch_team_stats_from_api แบบใหม่) ...
         url = f"{self.base_url}/fixtures"
         params = {"id": str(match_id)}
         headers = {"x-rapidapi-key": self.api_key, "x-rapidapi-host": "v3.football.api-sports.io"}
@@ -242,7 +278,6 @@ class FootballDataService:
                 home = item["teams"]["home"]["name"]
                 away = item["teams"]["away"]["name"]
                 
-                # Fetch Stats (Logic มี Cache รองรับแล้ว)
                 self._fetch_team_stats_from_api(item["league"]["id"], item["league"]["season"])
 
                 return {
@@ -254,6 +289,8 @@ class FootballDataService:
                     "league": item["league"]["name"],
                     "kickoff_time": item["fixture"]["date"],
                     "status": item["fixture"]["status"]["short"],
+                    "goals_home": item["goals"]["home"],
+                    "goals_away": item["goals"]["away"],
                     "home_stats": self.team_stats.get(home, {"attack":1.0, "defense":1.0, "form": "-----"}),
                     "away_stats": self.team_stats.get(away, {"attack":1.0, "defense":1.0, "form": "-----"})
                 }
@@ -261,7 +298,6 @@ class FootballDataService:
         return {}
 
     def get_head_to_head(self, team1_id: int, team2_id: int):
-        # ... (Logic เดิม ไม่ต้อง Cache หรือจะ Cache เป็นไฟล์ก็ได้ถ้าอยากทำ)
         if not self.api_key: return []
         url = f"{self.base_url}/fixtures/headtohead"
         params = {"h2h": f"{team1_id}-{team2_id}", "last": "5"}
@@ -349,8 +385,6 @@ class FootballDataService:
         except: return []   
 
     def get_history_matches(self, date_str: str):
-        # ⚠️ ประวัติย้อนหลัง อาจจะไม่ต้อง Cache ก็ได้ หรือจะ Cache เป็นรายวันก็ได้
-        # แต่เพื่อความง่าย ใช้ Logic เดียวกับ upcoming แต่ไม่ Cache ไฟล์รวม
         if not self.api_key: return []
         
         url = f"{self.base_url}/fixtures"
@@ -383,6 +417,7 @@ class FootballDataService:
                     "league": item["league"]["name"],
                     "score_home": item["goals"]["home"],
                     "score_away": item["goals"]["away"],
+                    "score": f"{item['goals']['home']} - {item['goals']['away']}",
                     "home_stats": self.team_stats.get(home, {"attack":1.0, "defense":1.0, "form": "-----"}),
                     "away_stats": self.team_stats.get(away, {"attack":1.0, "defense":1.0, "form": "-----"})
                 })
