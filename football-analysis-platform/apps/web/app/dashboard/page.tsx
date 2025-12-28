@@ -163,6 +163,13 @@ export default function Dashboard() {
        return (match.analysis?.goals_market.probability || 0) > 60;
     }
 
+    if (filter === "1H Goal") {
+      // 1. เอาเฉพาะคู่ที่ยังไม่เริ่ม หรือ กำลังแข่งครึ่งแรก
+      if (!['NS', 'TBD', 'PST', '1H', 'LIVE'].includes(status)) return false;
+      const htProb = match.analysis?.first_half_analysis?.probability || 0;
+       return htProb > 60; 
+    }
+
     return true;
   });
 
@@ -310,7 +317,7 @@ export default function Dashboard() {
             </div>
 
             <div className="flex bg-slate-950 p-1 rounded-lg w-full sm:w-auto">
-            {["Upcoming", "Live", "Value"].map(f => (
+            {["Upcoming", "Live", "Value","1H Goal"].map(f => (
                 <button 
                 key={f} 
                 onClick={() => setFilter(f)} 
